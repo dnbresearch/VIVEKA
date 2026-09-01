@@ -1,0 +1,93 @@
+# VIVEKA Default Configuration
+# ============================
+
+# Stage 1: Extraction
+extraction:
+  max_repos: null  # null = process all
+  n_workers: 16
+  clone_timeout: 120  # seconds
+  config_patterns:
+    - "*.yaml"
+    - "*.yml"
+    - "*.json"
+    - "*.toml"
+    - "*.sh"
+    - "*.bash"
+
+# Stage 2: Graph Construction
+graph:
+  similarity_threshold: 6.0  # τ
+  weights:
+    benchmark: 3.0
+    method: 2.0
+    parameter: 1.0
+    ablation: 2.5
+    same_venue: 0.3
+  use_inverted_index: true
+
+# Stage 3: Community Detection
+community:
+  algorithm: "louvain"
+  min_community_size: 3
+  coherence_threshold: 1.0
+  max_overlap: 0.5  # deduplication threshold
+
+# Stage 4: Hypothesis Generation
+hypothesis:
+  model: "claude-sonnet-4-6"
+  temperature: 0.0
+  max_tokens: 4096
+  hypotheses_per_community: 5
+
+# Evaluation
+evaluation:
+  judge_model: "claude-sonnet-4-6"
+  judge_temperature: 0.0
+  dimensions:
+    - specificity
+    - groundedness
+    - actionability
+    - cross_paper_novelty
+
+# Benchmark vocabulary (27 canonical benchmarks)
+benchmarks:
+  - imagenet
+  - cifar
+  - coco
+  - voc
+  - cityscapes
+  - ade20k
+  - mnist
+  - svhn
+  - celeba
+  - lfw
+  - kinetics
+  - ucf
+  - sst
+  - glue
+  - squad
+  - wmt
+  - wikitext
+  - lambada
+  - modelnet
+  - shapenet
+  - scannet
+  - ntu
+  - kitti
+  - mvtec
+  - visa
+  - mpdd
+  - btad
+
+# Generic methods (excluded from method features)
+generic_methods:
+  - training
+  - evaluation
+  - testing
+  - baseline
+  - default
+  - standard
+  - basic
+  - simple
+  - custom
+  - general

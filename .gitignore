@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Results (regenerable)
+results/*.json
+results/*.txt
+!results/.gitkeep
+
+# Cloned repositories (large)
+repos/
+cloned_repos/
+
+# Data (large, download separately)
+data/phase1_incremental.json
+data/merged_dataset_expanded.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# API keys
+.env

@@ -1,0 +1,32 @@
+{
+  "venues": [
+    {"name": "NeurIPS", "type": "ML", "years": [2021, 2022, 2023, 2024]},
+    {"name": "ICML", "type": "ML", "years": [2021, 2022, 2023, 2024]},
+    {"name": "ICLR", "type": "ML", "years": [2021, 2022, 2023, 2024]},
+    {"name": "CVPR", "type": "CV", "years": [2021, 2022, 2023, 2024]},
+    {"name": "ECCV", "type": "CV", "years": [2022, 2024]},
+    {"name": "ICCV", "type": "CV", "years": [2021, 2023]},
+    {"name": "ACL", "type": "NLP", "years": [2021, 2022, 2023, 2024]},
+    {"name": "EMNLP", "type": "NLP", "years": [2021, 2022, 2023, 2024]},
+    {"name": "NAACL", "type": "NLP", "years": [2021, 2022, 2024]},
+    {"name": "AAAI", "type": "ML", "years": [2021, 2022, 2023, 2024]},
+    {"name": "IJCAI", "type": "ML", "years": [2021, 2022, 2023]},
+    {"name": "KDD", "type": "DM", "years": [2021, 2022, 2023, 2024]},
+    {"name": "ICDM", "type": "DM", "years": [2021, 2022, 2023]},
+    {"name": "CIKM", "type": "DM", "years": [2021, 2022, 2023]},
+    {"name": "WSDM", "type": "DM", "years": [2021, 2022, 2023, 2024]},
+    {"name": "SIGIR", "type": "DM", "years": [2021, 2022, 2023]},
+    {"name": "WWW", "type": "DM", "years": [2021, 2022, 2023]},
+    {"name": "MICCAI", "type": "Medical", "years": [2021, 2022, 2023]},
+    {"name": "INTERSPEECH", "type": "Speech", "years": [2021, 2022, 2023]},
+    {"name": "COLING", "type": "NLP", "years": [2022, 2024]},
+    {"name": "EACL", "type": "NLP", "years": [2023, 2024]},
+    {"name": "AISTATS", "type": "ML", "years": [2021, 2022, 2023]},
+    {"name": "UAI", "type": "ML", "years": [2021, 2022, 2023]},
+    {"name": "WACV", "type": "CV", "years": [2022, 2023, 2024]},
+    {"name": "BMVC", "type": "CV", "years": [2021, 2022]},
+    {"name": "SDM", "type": "DM", "years": [2021, 2022]},
+    {"name": "PAKDD", "type": "DM", "years": [2021, 2022, 2023]},
+    {"name": "OCP", "type": "Science", "years": [2021, 2022, 2023]}
+  ]
+}

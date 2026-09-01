@@ -1,0 +1,25 @@
+# Core dependencies
+anthropic>=0.30.0
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+networkx>=3.0
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# For experimental validation
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+datasets>=2.14.0
+peft>=0.5.0
+
+# For graph visualization
+matplotlib>=3.7.0
+
+# For data collection
+requests>=2.28.0
+gitpython>=3.1.30
+
+# Optional: for DM experiments
+torch-geometric>=2.3.0

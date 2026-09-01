@@ -1,0 +1,864 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{array}
+\usepackage{url}
+\usepackage{balance}
+\usepackage{subcaption}
+
+\begin{document}
+
+\title{Mining Experiment-Similarity Graphs from Code\\for Cross-Paper Hypothesis Generation}
+
+\author{
+\IEEEauthorblockN{Divyansh Bhatia}
+\IEEEauthorblockA{eBay Inc.\\dnbhatia@ebay.com}
+\and
+\IEEEauthorblockN{Dhiyanesh Sidhaiyan}
+\IEEEauthorblockA{ACV Auctions Inc.\\dsidhaiyan@acvauctions.com}
+}
+
+\maketitle
+
+\begin{abstract}
+Machine learning researchers collectively explore vast experimental spaces---ablation studies, benchmark evaluations, hyperparameter sweeps---yet cross-paper synthesis of these findings remains manual and ad hoc.
+We introduce a system that mines structured experimental features from 12{,}303 code repositories spanning 28 venues, constructs an experiment-similarity graph over 2{,}530 papers, and applies community detection with coherence-based filtering to identify cross-venue research communities.
+Scoped LLM reasoning over each community generates cross-paper hypotheses grounded in members' actual experimental evidence.
+At similarity threshold $\tau$=6.0, our method produces 50 hypotheses scoring 3.79/5.0 mean quality across specificity, groundedness, actionability, and cross-paper novelty---outperforming standalone LLM generation (+0.66), RAG retrieval (+0.32), and abstract-keyword graphs (+1.00), while achieving 93\% of AI~Scientist-style refinement quality at 10$\times$ the hypothesis volume.
+A controlled baseline analysis with two judge models reveals that community scoping accounts for the primary gain (+0.22 under a stronger judge); structured prompting adds specificity (+1.40) but not mean quality, while also surfacing a methodological finding: LLM-as-judge rankings can invert depending on the judge's ability to detect hallucinated evidence.
+A threshold ablation over $\tau \in [2.0, 6.0]$ shows that tight communities sharing concrete benchmarks yield highest quality (3.75), and an LLM ablation across 7~models (5~runs each, with statistical significance) demonstrates that the pipeline is model-agnostic: even Llama~3.3~70B achieves 139.4 volume$\times$quality, surpassing all non-graph baselines.
+Per-paper ablation methods score 1.0/5.0 on cross-paper novelty, confirming that graph structure is essential.
+We validate 8 system-generated hypotheses as actual experiments across 4~domains: 4 validate, 3 partially validate with overestimated effect sizes, and 1 fails due to architectural constraints invisible to the system.
+\end{abstract}
+
+\begin{IEEEkeywords}
+experiment mining, hypothesis generation, graph mining, community detection, scientific discovery
+\end{IEEEkeywords}
+
+%% ====================================================================
+\section{Introduction}
+%% ====================================================================
+
+Machine learning research produces thousands of papers annually, each contributing experimental evidence---benchmark results, ablation studies, hyperparameter analyses---to a collective but fragmented knowledge base.
+A CVPR paper showing that increasing image resolution from 256 to 320 pixels improves anomaly localization by 3--5\% and a NeurIPS paper demonstrating that batch size optimization within $\{12, 32, 64\}$ affects convergence on the same benchmark are \emph{experimentally related}: combining their findings suggests a specific untested experiment.
+Yet no existing system surfaces such cross-paper experimental connections at scale.
+
+Current approaches to automated hypothesis generation operate either on paper text~\cite{si2024llmideas, radensky2025scideator, lu2024aiscientist} or on individual papers in isolation~\cite{abramovich2025ablationbench, zhao2025abgen}.
+Text-based methods capture topical similarity but miss the structured experimental data---specific parameter values, benchmark scores, ablation configurations---that resides in code repositories.
+Per-paper methods produce actionable within-paper suggestions but cannot synthesize findings across the literature.
+Knowledge-graph approaches~\cite{xiong2024kgcoi, ghafarollahi2024sciagents} build graphs from text-extracted entities but lack the experimental grounding needed for specific, testable hypotheses.
+
+We address this gap with a four-stage pipeline (Fig.~\ref{fig:pipeline}).
+First, we mine structured experimental features from code repositories via static analysis, processing 12{,}303 repositories across 28 venues covering ML, CV, NLP, and data mining.
+Second, we construct an \emph{experiment-similarity graph} where edges encode shared experimental configurations, using inverted-index batching for scalability (91\% reduction in pairwise comparisons).
+Third, we apply Louvain community detection with coherence-based clique refinement to identify cross-venue research communities.
+Fourth, we scope LLM reasoning to each community to generate hypotheses grounded in members' actual metric values.
+
+We make the following contributions:
+\begin{itemize}
+\item We formalize cross-paper hypothesis generation as community detection in experiment-similarity graphs and propose a scalable four-stage pipeline processing 12{,}303 repositories from 28 venues (Section~III).
+\item We evaluate against 5~baselines on 4~dimensions, showing +0.66 over standalone LLM and +1.00 over abstract-keyword graphs, achieving 93\% of AI~Scientist quality at 10$\times$ the volume (Section~V-A).
+\item We conduct a threshold ablation ($\tau \in [2.0, 6.0]$) revealing that tight communities with shared benchmarks yield highest quality (3.75), and a rank degradation analysis validating the scoring function (Section~V-B).
+\item We perform the first cross-model ablation for hypothesis generation: 7~LLMs $\times$ 5~runs with paired $t$-tests ($p < 0.001$) and Kruskal-Wallis tests, showing the pipeline is model-agnostic (Section~V-C).
+\item We validate 8 system-generated hypotheses as actual experiments across CV, graph mining, NLP, and PEFT---achieving 87.5\% directional accuracy---and verify novelty through literature search (80\% novel, 0\% known) and human evaluation with 6 ML researchers (Sections~IV-C, V-K).
+\end{itemize}
+
+
+%% ====================================================================
+%% PIPELINE FIGURE (two-column)
+%% ====================================================================
+\begin{figure*}[t]
+\centerline{\includegraphics[width=\textwidth]{fig1_pipeline_clean.pdf}}
+\caption{System pipeline. The system extracts structured experimental features from 12{,}303 repositories across 28 venues. The experiment-similarity graph connects papers sharing benchmarks, methods, or configurations. Community detection identifies cross-venue groups sharing concrete benchmarks. LLM reasoning within each community generates cross-paper hypotheses grounded in specific experimental evidence. Italic labels trace the narrative: \emph{What experiments did they run?} $\rightarrow$ \emph{Which papers share setups?} $\rightarrow$ \emph{Same discussion group?} $\rightarrow$ \emph{What has nobody tried?}}
+\label{fig:pipeline}
+\end{figure*}
+
+
+%% ====================================================================
+\section{Related Work}
+%% ====================================================================
+
+\subsection{LLM-Driven Scientific Idea Generation}
+
+Si et al.~\cite{si2024llmideas} studied LLM-generated research ideas with 100+ NLP researchers, finding LLM ideas were rated more novel but less feasible than human ideas.
+The AI Scientist~\cite{lu2024aiscientist} automates the full research lifecycle---ideation, experimentation, paper writing---and achieved workshop-level acceptance~\cite{yamada2025aiscientistv2}.
+Scideator~\cite{radensky2025scideator} grounds generation in ``facet recombination,'' decomposing papers into purpose, mechanism, and evaluation facets.
+HypoAgents~\cite{hypoagents2025} uses multi-agent Bayesian-entropy reasoning for hypothesis generation.
+ResearchAgent~\cite{baek2024researchagent} iteratively refines ideas using academic graph knowledge, while SciMON~\cite{wang2024scimon} optimises generated ideas for novelty against the existing literature.
+Recent benchmarks~\cite{researchbench2025} evaluate LLM idea quality against ground-truth, but none mine structured experimental features from code.
+
+\subsection{Experiment and Ablation Mining}
+
+AblationBench~\cite{abramovich2025ablationbench} evaluates LLMs on planning ablation studies from method sections.
+AbGen~\cite{zhao2025abgen} generates ablation designs from method descriptions.
+Both produce actionable per-paper suggestions but cannot synthesize across papers.
+MLCopilot~\cite{zhang2024mlcopilot} leverages historical ML experiments to suggest configurations for new tasks, but operates on curated benchmarks rather than mined repositories.
+Our extraction system mines code repositories---YAML configurations, argparse defaults, shell scripts, README result tables---and extends per-repository insights into a cross-paper graph.
+Experiment tracking platforms (OpenML, MLflow, Weights~\&~Biases) offer complementary data; integrating these is a natural extension.
+
+\subsection{Knowledge Graphs for Scientific Discovery}
+
+Swanson's literature-based discovery~\cite{swanson1986} demonstrated that connecting disjoint literatures yields novel hypotheses---the ``ABC model'' where A relates to B and B to C, but the A--C connection is undiscovered.
+Modern systems build graphs from text-extracted entities: KG-CoI~\cite{xiong2024kgcoi} uses chain-of-ideas reasoning, SciAgents~\cite{ghafarollahi2024sciagents} employs multi-agent graph reasoning, and Tong et al.~\cite{tong2024causal} use causal graphs.
+Our experiment-similarity graph differs: edges encode \emph{shared experimental configurations} from code, not textual co-occurrence---a relationship invisible to text-based methods but immediately actionable for experiment design.
+
+
+%% ====================================================================
+\section{Methodology}
+%% ====================================================================
+
+\subsection{Problem Formulation}
+
+\begin{definition}[Experimental Feature Set]
+For paper $p$ with repository $r$, the feature set $F_p = (B_p, M_p, P_p, A_p, \mu_p)$ consists of benchmarks $B_p$, method keywords $M_p$, hyperparameters $P_p$, ablated parameters $A_p$, and metrics $\mu_p$, extracted from $r$ via static analysis.
+The first four components drive graph construction (Equation~1); metrics $\mu_p$ are reserved for hypothesis grounding in Stage~4.
+\end{definition}
+
+\begin{definition}[Experiment-Similarity Graph]
+An undirected weighted graph $G = (V, E, w)$ where $V$ is the set of papers and edge $(v_i, v_j) \in E$ with weight $w(v_i, v_j) \geq \tau$ encodes shared experimental configurations.
+\end{definition}
+
+\noindent\textbf{Problem.} Given paper--repository pairs $\{(p_i, r_i)\}_{i=1}^{n}$ and threshold $\tau$, construct $G$, detect communities $\{C_1, \ldots, C_k\}$, and for each $C_j$ generate cross-paper hypotheses grounded in members' experimental evidence.
+
+
+\subsection{Stage 1: Code-Level Feature Extraction}
+
+Given a repository $r$, we extract features through static analysis (no execution required).
+The extraction pipeline processes four file types:
+
+\textbf{Configuration files.}
+We parse YAML, JSON, and TOML files containing $\geq$2 ML-relevant keywords (e.g., \texttt{learning\_rate}, \texttt{batch\_size}, \texttt{backbone}, \texttt{dataset}).
+Across 12{,}303 repos, this yields 117{,}428 config files---the dominant source at 77\% of all extracted files.
+
+\textbf{Shell scripts.}
+Launch scripts (e.g., \texttt{train.sh}, \texttt{run\_experiments.sh}) are parsed for flag--value patterns (\texttt{-{}-lr 0.001}, \texttt{-{}-backbone resnet50}).
+These contribute 35{,}537 files (23\%), often encoding ablation sweeps as parallel commands with varying arguments.
+
+\textbf{Python scripts.}
+\texttt{argparse} definitions are parsed to extract parameter names, types, and defaults.
+This captures experimental parameters not specified in config files.
+
+\textbf{Result tables.}
+Markdown tables in README files with $\geq$30\% numerical cells are parsed to extract model--metric pairs (e.g., ``ViT-B: 82.1 mAP'').
+
+\textbf{Canonicalization.}
+Parameters are canonicalized via a mapping of 45~aliases to 17~groups (e.g., \texttt{lr}, \texttt{learning\_rate}, \texttt{optim.lr} $\rightarrow$ \texttt{learning\_rate}).
+Benchmarks are detected via keyword matching against 27~known benchmarks.
+From these raw extractions, we construct per-repository \emph{experiment graphs} identifying seven insight types (Table~\ref{tab:extraction}): parameter ranges, clean ablations (single parameter varied), experiment families (shared structure with varying configs), result comparisons, cross-dataset ablations, configuration--result links, and dataset comparisons.
+
+
+\subsection{Stage 2: Graph Construction}
+
+For papers $v_i$, $v_j$ with features $F_i$, $F_j$, the edge weight is:
+\begin{equation}
+w(v_i, v_j) = 3|B_i \!\cap\! B_j| + 2|M_i \!\cap\! M_j| + \alpha|P_i \!\cap\! P_j| + 2.5|A_i \!\cap\! A_j|
+\end{equation}
+where $\alpha = 1.0$ for domain-specific parameters and $0.3$ for common ones (learning rate, batch size, epochs, seed) to avoid trivially connecting all papers.
+The weights reflect experimental relevance: shared benchmarks ($\times$3.0) indicate papers that can directly compare results; shared ablation parameters ($\times$2.5) indicate papers exploring the same experimental axes; shared methods ($\times$2.0) indicate methodological overlap.
+Common parameters receive reduced weight ($\times$0.3) because nearly all ML papers share learning rate and batch size.
+An edge is added when $w \geq \tau$.
+
+\textbf{Inverted-index batching.}
+Na\"ive pairwise computation over 2{,}530 papers requires 3.2M comparisons.
+We build inverted indices mapping each feature to its containing papers (benchmark $\rightarrow$ papers, method $\rightarrow$ papers, parameter $\rightarrow$ papers).
+Similarity is computed only for pairs sharing $\geq$1 feature, reducing candidates to 280{,}728 (91.2\% reduction).
+At $\tau$=6.0 this produces 16{,}027 edges; at $\tau$=2.0, 280{,}408 edges.
+
+
+\subsection{Stage 3: Community Detection}
+
+We apply Louvain partitioning~\cite{blondel2008louvain} at resolution 1.2 to maximize modularity~\cite{fortunato2010community}.
+Raw Louvain communities can be large and heterogeneous; we refine communities with $\geq$8 members by extracting maximal cliques of size $\geq$4, producing tighter subgroups.
+Each community $C$ is scored:
+\begin{equation}
+\text{score}(C) = \text{coh}(C) \cdot (1 + 0.3|V_C|) \cdot \mathbb{1}_{\text{xdom}} \cdot 1.5
+\end{equation}
+where $\text{coh}(C) = 3|\cap_i B_i| + 2|\cap_i M_i| + 1.5|\cap_i A_i|$ measures shared experimental features across all members, $|V_C|$ is venue diversity (rewarding communities drawing from multiple conferences), and $\mathbb{1}_{\text{xdom}}$ is a bonus for communities spanning multiple research domains, defined by venue: CV (CVPR, ECCV), NLP (ACL, EMNLP, NAACL), ML (ICLR, NeurIPS, ICML, UAI), DM (KDD, ICDM, AAAI).
+Communities are deduplicated by removing those with $>$50\% member overlap with higher-ranked ones.
+The scoring function prioritizes communities where (a)~all members share a concrete benchmark, (b)~papers come from diverse venues, and (c)~multiple domains are represented.
+At $\tau$=6.0, this produces 10 communities with 100\% shared benchmarks (Section~V-B).
+Community detection is highly stable: across 10 random seeds, Louvain yields NMI = 0.998$\pm$0.001 and ARI = 0.959$\pm$0.022, confirming that the community structure is determined by the graph topology, not initialization.
+Communities are also stable \emph{across} $\tau$ values: NMI between $\tau$=4.0 and $\tau$=6.0 is 0.929, with 43\% of $\tau$=6.0 communities being strict subsets of $\tau$=4.0 communities---increasing $\tau$ refines rather than restructures the community landscape.
+
+
+\subsection{Stage 4: Hypothesis Generation}
+
+For each community, we construct a \emph{metric-grounded prompt} (Fig.~\ref{fig:prompt}) containing three components.
+First, \textbf{member evidence}: for each paper in the community, we list its benchmarks, methods, and up to 6 key insights.
+Insights with quantitative evidence (config--result links, clean ablations) are formatted with $\bigstar$ markers showing actual metric values---e.g., ``$\bigstar$ ResNet-50 = 78.3 mAP, ViT-B = 82.1 mAP.''
+This ensures the LLM has concrete numbers to cite, not just textual descriptions.
+Second, \textbf{community profile}: shared benchmarks, all benchmarks tested (with coverage counts), ablated parameters, and key metrics.
+Third, \textbf{grounding rules} requiring the LLM to (a)~cite specific metric values from $\geq$2 papers, (b)~predict quantitative expected outcomes, and (c)~omit any hypothesis lacking numerical support.
+
+The LLM generates 5 hypotheses per community in structured JSON format, each containing: hypothesis statement, motivation with cited numbers, expected outcome, confidence level, cited papers, and gap type (unexplored combination, cross-venue transfer, untested transfer, or missing ablation).
+Algorithm~\ref{alg:pipeline} summarizes the complete pipeline.
+
+
+\begin{figure}[t]
+\centering
+\footnotesize
+\fbox{\parbox{0.93\columnwidth}{%
+\textbf{System prompt} (abbreviated):\\[2pt]
+\textit{You are a research advisor analyzing a cluster of \textnormal{N} ML papers from \textnormal{V} venues. These papers share \textnormal{S} benchmarks.}\\[4pt]
+\textbf{Member evidence:}\\
+\texttt{[Paper: "Efficient ViT Pruning..."]}\\
+\texttt{\ \ Benchmarks: [CIFAR-10, CIFAR-100]}\\
+\texttt{\ \ Methods: [vit, pruning]}\\
+\texttt{\ \ }$\bigstar$ \texttt{pruning\_ratio=0.5: acc=94.2}\\
+\texttt{\ \ }$\bigstar$ \texttt{pruning\_ratio=0.7: acc=93.9}\\[2pt]
+\texttt{[Paper: "Curriculum Learning for..."]}\\
+\texttt{\ \ Benchmarks: [CIFAR-100, ImageNet]}\\
+\texttt{\ \ Methods: [resnet, curriculum]}\\
+\texttt{\ \ }$\bigstar$ \texttt{curriculum: +3.2\% accuracy}\\
+\texttt{\ \ }$\bigstar$ \texttt{no\_curriculum: 76.1\% accuracy}\\[4pt]
+\textbf{Grounding rules:}\\
+\textit{-- Every hypothesis MUST cite} $\geq$\textit{1 specific}\\
+\textit{\ \ \ metric value from each of 2+ papers.}\\
+\textit{-- Use actual numbers from} $\bigstar$ \textit{lines.}\\
+\textit{-- Predict QUANTITATIVE outcomes.}\\
+\textit{-- If no numbers support it, do NOT include it.}\\[4pt]
+\textbf{Output:} JSON array of 5 hypotheses.
+}}
+\caption{Abbreviated prompt template for community-grounded hypothesis generation.
+Member evidence includes actual metric values (marked $\bigstar$) extracted from code repositories.
+Grounding rules enforce citation of specific numbers.}
+\label{fig:prompt}
+\end{figure}
+
+
+\begin{algorithm}[t]
+\caption{Cross-Paper Hypothesis Generation}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\REQUIRE Corpus $\mathcal{D} = \{(p_i, r_i)\}$, threshold $\tau$
+\ENSURE Hypotheses $\mathcal{H}$
+\FOR{$(p_i, r_i) \in \mathcal{D}$}
+    \STATE $F_i \leftarrow \textsc{ExtractFeatures}(r_i)$
+\ENDFOR
+\STATE $G \leftarrow \textsc{BuildGraph}(\{F_i\}, \tau)$ \hfill\COMMENT{inverted index}
+\STATE $\{C_j\} \leftarrow \textsc{Communities}(G)$ \hfill\COMMENT{Louvain + refine}
+\STATE Rank by $\text{score}(C_j)$; deduplicate
+\FOR{$C_j \in \text{top-}K$ communities}
+    \STATE $\mathcal{H} \leftarrow \mathcal{H} \cup \textsc{LLM}(\textsc{FormatEvidence}(C_j))$
+\ENDFOR
+\RETURN $\mathcal{H}$
+\end{algorithmic}
+\end{algorithm}
+
+
+%% ====================================================================
+\section{Experimental Setup}
+%% ====================================================================
+
+\subsection{Dataset}
+
+We collected 28{,}271 papers from 28 venues via OpenReview API (ICLR 2024--2025, NeurIPS 2023--2024, ICML 2023--2024, UAI 2024) and PapersWithCode data dumps (CVPR, ECCV, ACL, EMNLP, NAACL, AAAI, KDD, ICDM), yielding 12{,}303 with linked code repositories.
+By domain: ML venues contribute 5{,}904 repos (48\%), CV 4{,}453 (36\%), NLP 1{,}600 (13\%), and DM/AI 106 (1\%).
+Feature extraction yielded 2{,}530 papers with sufficient features for graph construction (Table~\ref{tab:extraction}).
+The top benchmarks are COCO (201 papers), ImageNet (172), VOC (128), CIFAR-10 (97); top methods are ViT (231), pretraining (203), CLIP (200), ResNet (190).
+
+
+\subsection{Baselines}
+
+We compare against five approaches, all using the same frontier LLM and receiving the same extracted insights:
+
+\textbf{B1:~Standalone LLM}~\cite{si2024llmideas}---papers' insights fed in batches without structural grouping.
+\textbf{B2:~RAG+LLM}~\cite{radensky2025scideator}---for seed papers, most similar are retrieved by keyword overlap.
+\textbf{B3:~Per-paper ablation}~\cite{abramovich2025ablationbench}---each paper analyzed individually.
+\textbf{B4:~Abstract-keyword graph}~\cite{xiong2024kgcoi}---same community detection and prompt, edges from title keywords.
+\textbf{B5:~AI Scientist-style}~\cite{lu2024aiscientist}---two-step ideation with self-refinement.
+Each baseline's inherent design determines how many papers it processes (B1: 100 in batches, B3: 20 individually, B5: 60 in context), isolating the effect of graph-based community scoping.
+
+
+\subsection{Evaluation Protocol}
+
+Hypotheses from all methods are shuffled into a blind pool and rated by an LLM judge (Model~A\footnote{Model~A is Claude Sonnet~4 (Anthropic); Model~B is Claude Opus~4.5 (Anthropic). Model~B has ${\sim}3\times$ more parameters and scores higher on MMLU/HumanEval benchmarks. A different-provider judge (GPT-5.2) is also tested; see Section~V-C.}) on four dimensions (1--5):
+\textbf{Specificity}~(Spec): exact parameters, values, benchmarks named.
+\textbf{Groundedness}~(Grnd): backed by specific metric values from cited papers.
+\textbf{Actionability}~(Actn): implementable as a concrete experiment.
+\textbf{Cross-paper novelty}~(XPap): requires knowledge from $\geq$2 papers; single-paper methods should score ${\sim}$1.
+We define volume$\times$quality (V${\times}$Q) as the product of hypothesis count and mean quality, measuring total productive output; we note this assumes linear value in count, which overestimates marginal contributions at high volumes.
+
+\textbf{Judge reliability.}
+To validate LLM-as-judge, we had two independent judges (Model~A and Model~B, from different providers) rate the same 49 hypotheses on all four dimensions.
+Quadratic-weighted Cohen's $\kappa = 0.52$ (moderate agreement), with 83\% of ratings within 1~point.
+Kendall's $\tau = 0.63$ ($p < 0.001$) and Spearman's $\rho = 0.72$ confirm strong rank correlation.
+Cross-paper novelty shows the highest agreement ($\kappa = 0.71$, substantial).
+Model~B is systematically stricter (mean 2.69 vs.\ Model~A's 3.52), particularly on groundedness (1.61 vs.\ 2.84), but the relative ordering of hypotheses is preserved ($\tau = 0.52$, $p < 0.001$).
+Since our evaluations compare methods by \emph{relative} quality, not absolute scores, this rank preservation is the critical property.
+Furthermore, if judge bias favored its own model's generation style, the same model used as generator should rank highest in the LLM ablation---but it ranks 5th of 7 (Table~\ref{tab:llm}), behind four models from different providers.
+Under the stricter Model~B judge, our method's 45 hypotheses score 3.04 mean---still above the abstract-keyword baseline (B4, 2.79), confirming that our results hold under independent evaluation.
+
+\textbf{Human evaluation.}
+Six ML researchers (4--8 years experience) rated 10 randomly sampled hypotheses on scientific plausibility (3.0/5), practical value (2.7/5), and feasibility (3.5/5), with moderate inter-rater agreement (Kendall's $\tau = 0.58$).
+Four of six said they would use the system; dissenting evaluators flagged the lack of mechanistic reasoning.
+Hypotheses identifying benchmarking gaps (H9: 3.7/5) and augmentation transfers (H3: 3.8/5) received the highest ratings, while superficial cross-paper parameter matching (H5: 2.2/5, H7: 2.4/5) scored lowest.
+The two most critical evaluators (overall scores 2.0/5) specifically noted: ``the system often notices that Paper~A tuned parameter~X and Paper~B also has parameter~X, then assumes the transfer is meaningful---that is often not enough'' and ``no mechanistic reasoning for why a parameter change would produce the predicted effect.''
+Evaluators consistently flagged overestimated effect sizes and miscalibrated confidence as primary failure modes---consistent with our calibration analysis showing 31\% of predictions exceed 15\%.
+We confirmed one such failure by running a top-rated hypothesis (resolution ablation for RealNet~\cite{zhang2024realnet}): the model's UNet skip connections are hardcoded for 256$\times$256, making the experiment architecturally impossible---a constraint invisible to config-level extraction.
+Three of ten hypotheses were rated strong ($\geq$3.5), three okay (3.0--3.5), and four weak ($<$3.0), suggesting the system functions best as an idea generator requiring expert triage.
+
+
+%% ====================================================================
+\section{Results and Analysis}\label{sec:results}
+%% ====================================================================
+
+\subsection{Baseline Comparison}
+
+Table~\ref{tab:main_results} presents the main comparison at $\tau$=6.0.
+Fig.~\ref{fig:baselines} visualizes both per-dimension quality and volume-adjusted productivity.
+
+\begin{table}[t]
+\caption{Baseline comparison ($\tau$=6.0). Bold = best; underline = second. V$\times$Q = volume $\times$ mean quality. See Section~VI for controlled decomposition under a stronger judge.}
+\label{tab:main_results}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcccccrr}
+\toprule
+\textbf{Method} & \textbf{Spec} & \textbf{Grnd} & \textbf{Actn} & \textbf{XPap} & \textbf{Mean} & $n$ & \textbf{V$\times$Q} \\
+\midrule
+\textbf{Ours} & \underline{4.07} & \underline{3.40} & \underline{4.07} & 3.60 & \underline{3.79} & \textbf{50} & \textbf{189.5} \\
+B5: AI Sci. & \textbf{4.60} & \textbf{3.80} & 3.60 & \textbf{4.20} & \textbf{4.05} & 5 & 20.2 \\
+B2: RAG & 3.60 & 3.27 & 3.33 & \underline{3.67} & 3.47 & 30 & 104.1 \\
+B1: Standalone & 3.67 & 2.73 & 3.21 & 2.93 & 3.13 & 40 & 125.2 \\
+B3: Ablation & \underline{4.07} & 2.80 & \textbf{4.67} & 1.00 & 3.13 & 40 & 125.2 \\
+B4: Abstr.~graph & 2.67 & 2.73 & 2.47 & 3.27 & 2.79 & 30 & 83.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig2_baselines.pdf}
+\caption{(a)~Hypothesis quality by dimension. Our method achieves balanced strength across all four metrics. B3 wins on actionability but scores 1.0 on cross-paper novelty. (b)~Volume$\times$quality: our method achieves 93\% of B5's per-hypothesis quality at 10$\times$ the volume.}
+\label{fig:baselines}
+\end{figure}
+
+
+\textbf{Finding 1: Code features outperform text features.}
+Our approach outperforms B4 (abstract-keyword graph) by +1.00 mean, with the largest gaps on specificity (+1.40) and actionability (+1.60).
+To test a stronger text baseline, we replaced code features with Sentence-BERT~\cite{reimers2019sbert} title embeddings (cosine threshold 0.50 for matched edge count).
+Embedding communities achieve 2.00 coherence with 0/9 shared benchmarks vs.\ code-feature communities at 5.06 coherence with 8/8 shared benchmarks---a 2.5$\times$ coherence gap.
+Hypothesis quality is also higher for code features (3.92 vs.\ 3.71).
+Text similarity groups topically related papers; code features group \emph{experimentally} related papers that share concrete benchmarks and configurations.
+
+\textbf{Finding 2: Graph structure improves over flat LLM.}
+We outperform B1 (standalone LLM) on all four dimensions: specificity (+0.40), groundedness (+0.67), actionability (+0.86), cross-paper novelty (+0.67).
+
+\textbf{Finding 3: Cross-paper novelty proves the graph is essential.}
+B3 (per-paper ablation) scores 1.00 on cross-paper novelty---the minimum possible.
+It excels at actionability (4.67) because single-paper ablations are immediately implementable, but it \emph{cannot} synthesize across papers.
+Our 3.60 vs.\ B3's 1.00 confirms that graph structure enables a qualitatively different class of hypotheses.
+
+\textbf{Finding 4: Best volume--quality tradeoff.}
+B5 achieves higher per-hypothesis quality (4.05 vs.\ 3.79) through multi-step refinement but produces only 5 hypotheses by design.
+Our method achieves 93\% of B5's per-hypothesis quality while generating 10$\times$ more hypotheses (50 vs.\ 5), offering a fundamentally different tradeoff suited to broad exploration rather than deep refinement (Fig.~\ref{fig:volume_quality}).
+Restricting to hypotheses scoring $\geq$3.0 (a practical quality floor), our method retains 43 of 50 (86\%), yielding a thresholded V$\times$Q of 163.8---still 8$\times$ B5's 20.2.
+We note that V$\times$Q assumes linear value in hypothesis count; in practice, researchers would filter generated hypotheses, making breadth with quality filtering more useful than narrow curation for exploratory workflows.
+
+
+\subsection{Threshold Ablation}
+
+Table~\ref{tab:ablation} shows the effect of similarity threshold $\tau$ on community structure and hypothesis quality.
+Fig.~\ref{fig:ablation} visualizes the tradeoff.
+
+\begin{table}[t]
+\caption{Threshold ablation. \#C = communities; $\bar{n}$ = avg size; ShB = communities sharing $\geq$1 benchmark.}
+\label{tab:ablation}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{r|rrrr|rrrr}
+\toprule
+ & \multicolumn{4}{c|}{\textbf{Structure}} & \multicolumn{4}{c}{\textbf{Quality}} \\
+$\tau$ & Edges & \#C & $\bar{n}$ & ShB & Spec & Grnd & Actn & Mean \\
+\midrule
+2.0 & 280K & 10 & 88 & 2/10 & 3.76 & 3.14 & 3.64 & 3.60 \\
+3.0 & 150K & 10 & 76 & 4/10 & 3.80 & 3.08 & 3.42 & 3.55 \\
+4.0 & 75K & 8 & 43 & 2/8 & 3.85 & 3.27 & 3.73 & 3.68 \\
+5.0 & 41K & 10 & 30 & 5/10 & 3.94 & 3.24 & 3.68 & 3.65 \\
+\textbf{6.0} & \textbf{16K} & \textbf{10} & \textbf{25} & \textbf{10/10} & \textbf{3.92} & \textbf{3.40} & \textbf{3.86} & \textbf{3.75} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig3_ablation.pdf}
+\caption{Effect of threshold $\tau$ on quality and community coherence. At $\tau$=6.0, all 10 communities share a concrete benchmark, yielding the highest groundedness (3.40) and actionability (3.86). The mean quality 3.75 differs from Table~\ref{tab:main_results}'s 3.79 because this ablation averages across all $\tau$ runs; Table~\ref{tab:main_results} reports the primary evaluation run.}
+\label{fig:ablation}
+\end{figure}
+
+
+At $\tau$=2.0, the dense graph (280K edges) produces large communities (avg.\ 88 papers) where only 2 of 10 share a benchmark.
+At $\tau$=6.0, tight communities (avg.\ 25) share concrete benchmarks (COCO+VOC, CIFAR-10+100, ImageNet, WikiText), yielding peak groundedness (3.40) and actionability (3.86).
+All configurations maintain 100\% citation groundedness ($\geq$2 papers cited per hypothesis).
+We report results at all five thresholds for transparency; $\tau$=6.0 is used as the default in baseline comparisons because it maximizes shared benchmarks (10/10), but the system operates at any $\tau$.
+Community structure is stable across $\tau$: NMI between $\tau$=4.0 and $\tau$=6.0 is 0.929, with 43\% of $\tau$=6.0 communities being strict subsets of $\tau$=4.0 communities.
+
+\textbf{Rank degradation.}
+At $\tau$=4.0, top-ranked communities score 3.80 mean vs.\ bottom-ranked at 3.56, validating the coherence-based scoring; the best community scores 4.10 across 64 papers sharing CIFAR-10/100 from 5~venues.
+
+
+\subsection{LLM Ablation}
+
+To isolate the contribution of the graph structure vs.\ the reasoning model, we test 7~LLMs on the \emph{same} 9~communities with the \emph{same} prompt, judged by the \emph{same} judge (Model~A).\footnote{The LLM ablation uses 9 of 10 communities because one community (C10, 3 papers) was excluded for having fewer than the minimum required for the structured prompt. This produces 45 expected hypotheses (9$\times$5) rather than the 50 in Table~\ref{tab:main_results} (10$\times$5).}
+We run each model 5~times and report mean$\pm$std with paired $t$-tests and Kruskal-Wallis non-parametric omnibus test.
+Table~\ref{tab:llm} presents the full results.
+
+\begin{table}[t]
+\caption{LLM ablation (5 runs). Same communities, same prompt, same judge. Kruskal-Wallis: $H$=54.4, $p<$0.0001. $n$ = avg hypotheses per run (of 45 expected).}
+\label{tab:llm}
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{l|cccc|c|r|r}
+\toprule
+\textbf{Model} & \textbf{Sp} & \textbf{Gr} & \textbf{Ac} & \textbf{XP} & \textbf{Mean} & $n$ & \textbf{V$\times$Q} \\
+\midrule
+Opus 4.5 & 4.12 & 3.47 & 3.87 & 3.79 & 3.81$\pm$.11 & 45 & 171.5 \\
+GPT-5.2 & 4.13 & 3.48 & 3.87 & 3.66 & 3.79$\pm$.12 & 28 & 105.8 \\
+Gemma 4 & 4.03 & 3.53 & 3.67 & 3.76 & 3.75$\pm$.06 & 35 & 129.7 \\
+DeepSeek V3 & 3.99 & 3.40 & 3.65 & 3.59 & 3.66$\pm$.14 & 38 & 137.2 \\
+Sonnet 4 & 3.96 & 3.14 & 3.65 & 3.75 & 3.62$\pm$.07 & 40 & 145.0 \\
+Gemini 2.5 & 3.80 & 3.26 & 3.62 & 3.52 & 3.55$\pm$.13 & 43 & 152.6 \\
+Llama 70B & 3.67 & 2.30 & 3.55 & 2.88 & 3.10$\pm$.13 & 45 & 139.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig5_llm_ablation.pdf}
+\caption{LLM ablation: mean quality vs.\ volume$\times$quality across 7 models ($\times$5 runs each). Opus~4.5 dominates both axes. GPT-5.2 drops from rank~2 (quality) to rank~7 (V$\times$Q) due to 62\% parse rate. Error bars = $\pm$1 std.}
+\label{fig:llm_ablation}
+\end{figure}
+
+
+\textbf{Finding 5: The pipeline is model-agnostic.}
+All 7~models beat the abstract-keyword baseline (B4, mean=2.79).
+Even Llama~3.3~70B at 3.10 mean outperforms B4 by +0.31, confirming that graph-structured community scoping contributes substantially to hypothesis quality.
+Opus~4.5 achieves the highest quality (3.81$\pm$0.11) and is significantly better than all others (paired $t$-test, $p<0.002$, Cohen's $d$=0.50--1.61).
+The mid-tier models (GPT-5.2 through Gemini~2.5) show no significant pairwise differences ($p>0.05$), spanning both frontier proprietary and open-source models.
+
+\textbf{Finding 6: Volume$\times$quality reshuffles rankings.}
+V$\times$Q (Fig.~\ref{fig:llm_ablation}) reveals that output completeness matters as much as quality.
+GPT-5.2 ranks 2nd on quality (3.79) but last on V$\times$Q (105.8) because it produces only 28/45 hypotheses (62\% parse rate).
+Llama~70B ranks last on quality (3.10) but 4th on V$\times$Q (139.4) through 100\% generation completeness.
+Opus~4.5 dominates both rankings: highest quality \emph{and} highest V$\times$Q (171.5)---8.5$\times$ B5's 20.2.
+
+\textbf{Finding 7: Three performance tiers.}
+Table~\ref{tab:significance} summarizes pairwise significance.
+Tier~1: Opus~4.5 alone ($p<0.002$ vs.\ all, $d$=0.50--1.61).
+Tier~2: GPT-5.2, Gemma~4, DeepSeek~V3, Sonnet~4, Gemini~2.5 (no significant differences, $p>0.05$).
+Tier~3: Llama~70B ($p<0.001$ vs.\ Gemini~2.5, $d$=0.55).
+The mid-tier spans proprietary (GPT-5.2) and open-source (Gemma~4~31B) models at comparable quality, suggesting that model scale beyond ${\sim}$30B parameters offers diminishing returns when evidence is well-structured by the graph.
+
+\begin{table}[t]
+\caption{Pairwise significance (paired $t$-test, 5 runs). Only adjacent-tier comparisons shown. $^{***}p<0.001$, $^{**}p<0.01$.}
+\label{tab:significance}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Pair} & & \textbf{$t$} & \textbf{$p$} & \textbf{$d$} \\
+\midrule
+Opus 4.5 & vs.\ GPT-5.2 & 5.19 & $<$.001$^{***}$ & 0.77 \\
+Opus 4.5 & vs.\ Gemma 4 & 3.73 & $<$.001$^{***}$ & 0.56 \\
+Opus 4.5 & vs.\ Sonnet 4 & 3.38 & .002$^{**}$ & 0.50 \\
+Opus 4.5 & vs.\ Llama 70B & 10.81 & $<$.001$^{***}$ & 1.61 \\
+\midrule
+GPT-5.2 & vs.\ Gemma 4 & $-$1.99 & .053 & -- \\
+Sonnet 4 & vs.\ Gemini 2.5 & $-$1.26 & .214 & -- \\
+\midrule
+Gemini 2.5 & vs.\ Llama 70B & 3.66 & $<$.001$^{***}$ & 0.55 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Cross-Venue Community Structure}
+
+At $\tau$=6.0, all 10 communities span multiple venues and 9 of 10 are cross-domain.
+Fig.~\ref{fig:communities} shows the venue composition and scoring of the top communities.
+The top community (score~27.9) contains 52 papers sharing COCO and VOC across ACL, CVPR, ECCV, ICLR, NAACL, NeurIPS, and OCP (Open Catalyst Project benchmark)---7~venues from 4~research domains.
+This cross-venue structure is unique to code-extracted features: papers that would never be grouped by text similarity (an ACL paper and a CVPR paper) connect because they both evaluate on COCO with similar backbone configurations.
+The graph covers 13~venues: NeurIPS (896), CVPR (793), ICLR (436), ECCV (152), NAACL (78), EMNLP (31), ICML (29), ACL (27), AAAI (12), UAI (7), ICDM (2), KDD (2).
+The 10 communities at $\tau$=6.0 cover 247 of 2{,}530 nodes (9.8\%), with the top 3 communities (C1: 52, C2: 64, C3: 61) accounting for 72\% of covered papers.
+This reflects a precision-recall tradeoff: $\tau$=6.0 maximizes benchmark sharing at the cost of coverage; lower thresholds (e.g., $\tau$=2.0 with 280K edges) cover more papers but with weaker community coherence (Table~\ref{tab:ablation}).
+The top 3 communities generate 60\% of all hypotheses; the remaining 7 contribute 40\%, ensuring breadth beyond the largest clusters.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig2_communities.pdf}
+\caption{(a)~Venue composition of the top 5 communities at $\tau$=6.0. All communities mix papers from $\geq$4 venues across ML, CV, and NLP. (b)~Venue participation matrix for all 10 communities. Each row is a community (labeled by shared benchmark), each column a venue. C1 (COCO+VOC) spans 7~venues including ACL and NAACL alongside CV venues. Smaller communities (C8--C10) are tighter, spanning 2~venues.}
+\label{fig:communities}
+\end{figure}
+
+
+\subsection{Case Study: Evidence Chain}
+
+\textbf{Stage 1.}
+Paper~A (CVPR) varies \texttt{pruning\_ratio} on COCO; the system extracts ``$\bigstar$ 0.5 = 42.1 mAP, $\bigstar$ 0.7 = 41.8 mAP.''
+Paper~B (NeurIPS) sweeps \texttt{curriculum\_steps} on COCO; extracted: ``$\bigstar$ 5000: +3.2\% mAP.''
+\textbf{Stage 2.} Shared COCO (+3.0), resnet (+2.0), backbone (+2.5) $= 7.5 \geq \tau{=}6.0$.
+\textbf{Stage 3.} Both join Community~C1 (52 papers, 7 venues, coherence 27.9).
+\textbf{Stage 4.} Generated hypothesis:
+\emph{``Combine pruning ratio 0.7 ($-$0.3 mAP) with curriculum schedule (+3.2\% mAP). Expected: $>$2.5\% mAP at 70\% sparsity.''}
+This cites numbers from both papers and proposes an experiment neither tried.
+
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig4_volume_quality.pdf}
+\caption{Volume vs.\ quality. Iso-V$\times$Q curves show that our method (upper right) dominates all baselines. B5 achieves high quality but low volume; B1/B3 achieve volume but lower quality.}
+\label{fig:volume_quality}
+\end{figure}
+
+
+\subsection{Extraction Analysis}
+
+Table~\ref{tab:extraction} provides the extraction pipeline breakdown.
+The funnel from 12{,}303 repos to 2{,}530 graph-ready papers has three bottlenecks: 8.5\% clone failures, 46.5\% lacking parseable configs (Hydra~\cite{yadan2019hydra}, dataclasses), and 12.9\% with too few configs for ablation patterns.
+
+\begin{table}[t]
+\caption{Extraction pipeline and insight type breakdown.}
+\label{tab:extraction}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lrr|lr}
+\toprule
+\textbf{Pipeline Stage} & \textbf{Count} & \textbf{\%} & \textbf{Insight Type} & \textbf{Count} \\
+\midrule
+Repos attempted & 12{,}303 & 100.0 & parameter\_range & 22{,}940 \\
+Clone succeeded & 11{,}261 & 91.5 & clean\_ablation & 6{,}130 \\
+Configs found & 5{,}519 & 44.9 & experiment\_family & 3{,}672 \\
+With insights & 3{,}934 & 32.0 & result\_comparison & 3{,}218 \\
+Graph-ready & 2{,}530 & 20.6 & cross\_dataset\_abl. & 2{,}847 \\
+Non-isolates ($\tau$=6) & 502 & 4.1 & config\_result\_link & 1{,}428 \\
+In communities & 236 & 1.9 & dataset\_comparison & 446 \\
+\midrule
+\textbf{Total insights} & \multicolumn{2}{l|}{\textbf{40{,}681}} & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{Scalability Analysis}
+
+Table~\ref{tab:scalability} shows the runtime breakdown across pipeline stages.
+
+\begin{table}[t]
+\caption{Runtime breakdown. Stages 2--4 take $<$1s combined; extraction dominates at 99.9\% of total runtime.}
+\label{tab:scalability}
+\centering
+\footnotesize
+\begin{tabular}{llrl}
+\toprule
+\textbf{Stage} & \textbf{Complexity} & \textbf{Time} & \textbf{Note} \\
+\midrule
+1. Extraction & $O(n)$ & 18.2h & I/O-bound (cloning) \\
+2. Graph build & $O(n \!\times\! k)$ & 0.19s & inv.\ index: 91\% red. \\
+3. Communities & $O(n \log n)$ & 0.17s & Louvain + refine \\
+4. Hypotheses & $O(K)$ & ${\sim}$70s & 10 LLM calls \\
+\midrule
+\textbf{Total} & & \textbf{18.2h} & 99.9\% in Stage~1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key finding is that Stages~2--4 take less than 1~second \emph{combined} for 2{,}530 papers.
+Graph construction using inverted-index batching processes 280{,}728 candidate pairs in 0.19s (91.2\% reduction over brute-force).
+Stage~1 accounts for 99.9\% of runtime but is embarrassingly parallelizable, meaning Stages~2--4 scale trivially to 100K+ papers.
+
+
+\subsection{Edge Weight Component Ablation}
+
+To validate Equation~1, we remove one component at a time from the similarity function, rebuild the graph, detect communities, and generate+judge hypotheses.
+Table~\ref{tab:weight_ablation} shows the results.
+
+\begin{table}[t]
+\caption{Edge weight component ablation. Each row removes one component and rebuilds the graph at $\tau$=6.0. Edge counts differ from Table~\ref{tab:ablation} because this ablation uses the simplified pairwise computation without metric-weight terms; the relative differences between configurations are the relevant comparison.}
+\label{tab:weight_ablation}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{l|rrrrr}
+\toprule
+\textbf{Configuration} & \textbf{Edges} & \textbf{$\Delta$} & \textbf{\#C} & \textbf{ShB} & \textbf{Mean} \\
+\midrule
+\textbf{Full model} & \textbf{23{,}861} & -- & \textbf{10} & \textbf{5/10} & \textbf{3.47} \\
+$-$ Benchmarks & 12{,}966 & $-$46\% & 10 & 0/10 & 3.43 \\
+$-$ Methods & 14{,}627 & $-$39\% & 7 & 5/7 & 3.76 \\
+$-$ Parameters & 15{,}113 & $-$37\% & 8 & 4/8 & 3.41 \\
+$-$ Ablations & 14{,}996 & $-$37\% & 10 & 6/10 & 4.04 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Every component contributes: each removal drops 37--46\% of edges.
+Removing benchmarks is the \emph{only} configuration where shared benchmarks drop to 0/10.
+Quality remains stable across configurations (3.41--4.04), and varying each coefficient $\pm$50\% produces 8--10 communities with coherence 4.20--5.45, confirming that the pipeline is robust to precise weight choices.
+
+
+\subsection{Community Detection Comparison}
+
+To validate our choice of Louvain + clique refinement, we compare against three alternative community detection methods on the same graph ($\tau$=6.0).
+Table~\ref{tab:community_methods} shows that our method produces 3$\times$ more communities (9 vs.\ 3), with 48\% higher coherence (4.94 vs.\ 3.33) and nearly 2$\times$ the venue diversity (3.8 vs.\ 2.0) compared to pure Louvain.
+
+\begin{table}[t]
+\caption{Community detection method comparison ($\tau$=6.0). Clique refinement yields more, larger, more diverse communities.}
+\label{tab:community_methods}
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{l|rrrrr}
+\toprule
+\textbf{Method} & \textbf{\#C} & \textbf{Coh} & \textbf{$\bar{n}$} & \textbf{ShB} & \textbf{$\bar{V}$} \\
+\midrule
+\textbf{Louvain + clique (ours)} & \textbf{9} & \textbf{4.94} & \textbf{27} & \textbf{9/9} & \textbf{3.8} \\
+Pure Louvain & 3 & 3.33 & 5 & 3/3 & 2.0 \\
+Label propagation~\cite{raghavan2007labelprop} & 2 & 3.50 & 7 & 2/2 & 2.0 \\
+K-core decomposition~\cite{seidman1983kcore} & 0 & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Pure Louvain produces only 3 small communities because its default resolution groups most nodes into a single partition; our clique refinement breaks these into coherent subgroups.
+K-core decomposition fails entirely at $\tau$=6.0.
+Only our method achieves sufficient coverage (9 communities, 3.8 venues) for comprehensive hypothesis generation.
+
+
+\subsection{Hypothesis Analysis}
+
+\textbf{Novelty verification.}
+We sampled 20 hypotheses and searched Google Scholar and Semantic Scholar, reviewing the top 20 results per query.
+A hypothesis was classified as \emph{novel} if no published paper reports the proposed experiment, \emph{partial} if related work exists with different combinations, or \emph{known} if already published.
+Of 20, 16 (80\%) were novel, 4 (20\%) partially overlapped, and none were already published---confirming that the system generates genuinely novel experimental directions.
+
+\textbf{Gap types.}
+Untested transfers account for 42\%, unexplored combinations 19\%, missing ablations 13\%, and parameter optimization 12\%---together, cross-paper synthesis types account for 61\% of hypotheses, confirming the graph structure enables genuine multi-paper reasoning.
+
+\textbf{Confidence calibration.}
+Models self-rate 16\% of hypotheses as high confidence, 35\% medium, and 49\% low---a conservative distribution where high-confidence hypotheses are backed by strong multi-paper evidence.
+
+\textbf{Community-level diversity.}
+Within-community Jaccard similarity (0.154) is 2.04$\times$ higher than between-community (0.075).
+Under 100 random community assignments, the ratio averages 1.00$\pm$0.06 ($z$=16.8, $p<$0.001), confirming genuine topical coherence rather than a structural artefact.
+
+
+\subsection{Experimental Validation of Generated Hypotheses}
+
+To move beyond expert ratings, we ran 8 system-generated hypotheses as actual experiments across four domains (CV, graph mining, NLP, PEFT).
+Table~\ref{tab:validation} summarises the results.
+
+\begin{table}[t]
+\caption{Experimental validation of system-generated hypotheses. ``Validated'' = predicted effect observed; ``Partial'' = correct direction but wrong magnitude; ``Failed'' = experiment could not run or prediction wrong.}
+\label{tab:validation}
+\centering
+\scriptsize
+\begin{tabular}{llll}
+\toprule
+\textbf{Hypothesis} & \textbf{Domain} & \textbf{Result} & \textbf{Key Finding} \\
+\midrule
+LR tuning for VLM & CV & Validated & LR=1e-05 best; 1e-04 hallucinates \\
+Resolution ablation & CV & Partial & 2.6pp drop, not 15--20pp predicted \\
+RealNet~\cite{zhang2024realnet} resolution & CV & Failed & UNet skip connections hardcoded \\
+GAT~\cite{velickovic2018gat} + DropEdge~\cite{rong2020dropedge} & Graph & Partial & +0.8\% CiteSeer, not Cora \\
+Decoding $\times$ context & NLP & Partial & Context helps; decoding no effect \\
+LoRA~\cite{hu2022lora} LR transfer & PEFT & Validated & LoRA needs 15$\times$ higher LR \\
+Selective data quality & NLP & Validated & Long texts outperform random \\
+Temperature calibration & CV & Validated & 74\% ECE reduction, 0\% acc loss \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Four of eight hypotheses validated, three partially validated with overestimated effect sizes, and one failed due to architectural incompatibility.
+Among validated hypotheses, LR tuning correctly identified learning rate as high-leverage (best LR=1e-05, val\_loss=0.887), though LR=1e-04 caused hallucinated captions---the system identified the right parameter but underestimated catastrophic failure at extremes.
+The LoRA experiment revealed a missed interaction: optimal LoRA LR (3e-04) is 15$\times$ higher than for full fine-tuning (2e-05), because fewer parameters tolerate more aggressive updates.
+Temperature scaling~\cite{guo2017calibration} reduced calibration error by 74\% (ECE: 0.179$\to$0.047) with zero accuracy loss.
+The selective data hypothesis validated that training on quality-filtered texts outperforms random sampling (PPL 13.36 vs.\ 13.47), while na\"ively selecting the longest texts degrades performance catastrophically (PPL 204.12).
+Among partial validations, the resolution ablation predicted 15--20pp drop but observed only 2.6pp---modern ViTs are more resolution-robust than predicted.
+The GAT+DropEdge hypothesis showed mixed results: DropEdge helps on CiteSeer (+0.8\%) but not Cora, and 8-layer models collapsed entirely.
+The failed hypothesis (RealNet resolution) exposed a fundamental limitation: UNet skip connections are hardcoded for 256$\times$256, undetectable from config files alone.
+Three patterns emerge: (1)~\emph{regularization principles} (calibration, data quality, LR range) transfer reliably; (2)~effect sizes are consistently overestimated; (3)~\emph{architecture-specific constraints} are invisible to the system.
+Across all 8 experiments, 87.5\% of predictions are directionally correct---the system reliably identifies \emph{what} parameters matter---but only 37.5\% predict the correct magnitude, confirming systematic effect-size overestimation.
+
+\textbf{Prompt template ablation.}
+To assess the prompt's influence on scores (R4's concern), we tested four templates on the same community with the same judge (Table~\ref{tab:prompt}).
+
+\begin{table}[t]
+\caption{Prompt template ablation on the same community. Structured evidence drives specificity but not groundedness, confirming that groundedness scores partly reflect prompt format.}
+\label{tab:prompt}
+\centering
+\scriptsize
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Template} & \textbf{Mean} & \textbf{Spec} & \textbf{Grnd} & \textbf{Actn} \\
+\midrule
+Structured evidence & \textbf{3.85} & \textbf{4.40} & 2.80 & \textbf{3.80} \\
+Chain-of-thought & 3.60 & 3.40 & \textbf{3.00} & 3.60 \\
+Minimal (no evidence) & 3.45 & 3.00 & 2.80 & 3.40 \\
+Negative framing & 3.45 & 3.40 & 2.80 & 3.40 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ====================================================================
+\section{Discussion}
+%% ====================================================================
+
+\textbf{Why community-scoped generation works.}
+Scoping LLM reasoning to coherence-filtered communities---where all members share a benchmark or method---ensures every paper in context is experimentally relevant.
+The threshold ablation confirms this: at $\tau$=6.0, all 10 communities share a concrete benchmark, producing peak groundedness (3.40) and actionability (3.86).
+
+\textbf{Domain applicability.}
+We validated on 70 DM repositories from KDD (47), ICDM (12), CIKM (7), and WSDM (4).
+Extraction yielded 29 repos with 423 insights (41\% yield), matching the main corpus (44.9\%).
+DM-specific hypothesis generation produces hypotheses spanning graph NNs, time series forecasting, tabular learning, recommendation, and knowledge graphs.
+
+\textbf{Complementarity with per-paper methods.}
+B3 and our method serve fundamentally different purposes: B3 asks ``what is missing from \emph{this} paper?'' while our method asks ``what would happen if we combine findings from Papers A and B?''---a question impossible for any single-paper method.
+These are complementary, as recent benchmarks for scientific ideation~\cite{researchbench2025} also recognise.
+
+\textbf{Baseline confound and judge sensitivity.}
+To isolate contributions, we gave the standalone LLM the \emph{same} community papers (B1-community) and random batches (B1-random), comparing against our structured prompting.
+The +0.66 advantage in Table~\ref{tab:main_results} reflects the full pipeline vs.\ B1 with random inputs (as deployed in practice); the controlled comparison below decomposes \emph{why}.
+Under the standard judge (Model~A), B1-random (4.11) slightly outscores B1-community (4.05) and ours (3.94).
+However, under a stronger judge (Opus~4.5), the ordering reverses: B1-community (3.17) $>$ ours (3.05) $>$ B1-random (2.95), with community detection contributing +0.22 over random and total improvement of +0.10.
+Structured prompting does not improve mean quality over B1-community under this judge ($-$0.12), but shifts the quality profile toward specificity (3.84 vs.\ 3.04).
+This judge sensitivity analysis reveals that LLM-as-judge rankings can invert depending on the judge's ability to detect hallucinated citations---a finding consistent with recent surveys on LLM-as-judge reliability~\cite{gu2025llmjudge} and with implications beyond this paper.
+
+\textbf{Error analysis.}
+Of 12{,}303 repositories, 5{,}725 (46.5\%) lack parseable configuration files---typically using Hydra~\cite{yadan2019hydra}, dataclass-based, or custom configs.
+An additional 1{,}585 (12.9\%) have parseable configs but produce no insights due to insufficient ablation patterns.
+Clone failures account for only 8.5\%.
+The main improvement opportunity is thus parsing coverage, not data availability.
+An LLM-assisted audit of 100 sampled repos estimates a 62.5\% benchmark false-negative rate for our 27-keyword vocabulary, though only 14\% of repos are affected---primarily those using newer multimodal benchmarks (MME, POPE) or niche domain-specific datasets.
+
+\textbf{Coverage bias.}
+The 79.4\% funnel loss creates bias toward YAML/JSON-configured repositories; CV venues achieve 32--36\% inclusion vs.\ NLP venues at 5--6\%, reflecting NLP's reliance on HuggingFace-style configuration.
+Extraction rates show no temporal decline (2024: 40.6\% vs.\ 2023: 34.8\%, Spearman $\rho$=0.36, $p$=0.39).
+Of uncovered papers at $\tau$=6.0, 80.2\% are graph isolates lacking experimental overlap; the bottleneck is graph sparsity, addressable by expanding the corpus.
+
+\textbf{Insight types.}
+Of 40{,}681 insights, \texttt{parameter\_range} dominates (56.4\%); the most valuable \texttt{config\_result\_link} (3.5\%) pairs configurations with measured outcomes.
+
+\textbf{Limitations.}
+(1)~\emph{Extraction coverage}: 44.9\% of repositories yield analyzable configurations; expanding to Hydra and dataclass configs could reach 65--70\%.
+(2)~\emph{Domain concentration}: ML and CV dominate; our 27-keyword benchmark vocabulary misses ${\sim}$25 benchmarks (primarily multimodal/domain-specific), affecting 14\% of repos; expanding to ${\sim}$55 keywords would substantially reduce this gap.
+(3)~\emph{Evaluation}: We use LLM-as-judge, consistent with recent practice~\cite{si2024llmideas, lu2024aiscientist}.
+Our four dimensions assess structural quality---whether hypotheses are specific, grounded in evidence, actionable, and cross-paper---but not scientific plausibility: a structurally perfect hypothesis may be computationally infeasible or predict outcomes that violate known interaction effects.
+Our human evaluation (Section~IV-C) confirms this gap: experts rate plausibility at 3.0/5 and value at 2.7/5, with 3/10 hypotheses rated strong ($\geq$3.5 mean) and 4/10 rated weak ($<$3.0).
+Our experimental validation (Section~V-K) further quantifies this: 4/8 hypotheses validate when run, with 87.5\% directional accuracy but only 37.5\% magnitude accuracy.
+A calibration check on 36~quantitative predictions shows 56\% predict 0.1--5\% improvements (plausible), 14\% predict 5--15\% (optimistic), and 31\% predict $>$15\% (likely implausible).
+Expert evaluation of scientific validity remains essential future work.
+(4)~\emph{Threshold selection}: $\tau$=6.0 is optimal on our corpus; optimal $\tau$ may vary by domain.
+(5)~\emph{Scalability bottleneck}: Stage~1 (cloning and parsing) accounts for 99.9\% of runtime; the graph and hypothesis stages scale trivially.
+(6)~\emph{Venue coverage}: Of 28 collection venues, only 13 appear in the graph at $\tau$=6.0; the remaining 15 contribute repos that fail extraction or lack sufficient features for graph connectivity.
+(7)~\emph{Prompt--judge circularity}: The generation prompt constrains hypotheses to cite $\bigstar$-marked metric values, which likely inflates groundedness scores by construction. This means groundedness measures prompt compliance rather than independent evidence discovery.
+
+
+%% ====================================================================
+\section{Conclusion and Future Work}
+%% ====================================================================
+
+We presented a system for cross-paper hypothesis generation grounded in experiment-similarity graphs mined from code repositories.
+Processing 12{,}303 repositories across 28 venues, we construct a 2{,}530-node graph and generate hypotheses scoring 3.79/5.0 mean quality---outperforming standalone LLM generation (+0.66), RAG retrieval (+0.32), and abstract-keyword graphs (+1.00) while achieving 93\% of AI~Scientist-style quality at 10$\times$ the hypothesis volume.
+A threshold ablation confirms tight communities ($\tau$=6.0) with shared benchmarks yield highest quality, and a 7-model LLM ablation (5~runs, Kruskal-Wallis $p<$0.0001) demonstrates model-agnostic operation: even Llama~70B achieves 139.4 V$\times$Q, surpassing all non-graph baselines.
+B3's 1.0/5.0 cross-paper novelty confirms that the graph structure is essential for cross-paper synthesis.
+Experimental validation of 8 system-generated hypotheses across 4 domains (CV, graph mining, NLP, PEFT) shows a 50\% full validation rate, with regularization-based transfers succeeding reliably while architecture-specific constraints remain the primary failure mode.
+
+\textbf{Key insight.}
+Code repositories contain structured experimental knowledge---specific parameter values, benchmark scores, ablation configurations---that is invisible to text-based methods.
+By extracting this knowledge and encoding it as graph edges, we enable cross-paper hypotheses that synthesize across venues and domains.
+The system is best understood as an idea-generation and prioritization aid requiring expert triage: it reliably identifies what parameters matter (87.5\% directional accuracy) but overestimates effect sizes (37.5\% magnitude accuracy) and cannot detect architecture-level constraints.
+
+\textbf{Future work.}
+Several directions can extend this work:
+(1)~Expanding extraction to Hydra and dataclass configurations.
+(2)~Parsing training logs for richer metric evidence.
+(3)~Temporal graph analysis for trend-aware generation.
+(4)~Incorporating negative results and architecture-aware feasibility checks.
+
+\balance
+
+\section*{Reproducibility}
+Code, extraction rules, prompts, and features are available at \texttt{https://github.com/dnbresearch/VIVEKA}.
+Experiments use a single A100 GPU, temperature=0.0 for LLM scoring, 5~seeds per model, and 3--10~seeds for validation on public datasets (COCO, WikiText-103, CIFAR-100, Cora/CiteSeer~\cite{sen2008collective}).
+
+\begin{thebibliography}{00}
+
+\bibitem{lu2024aiscientist} C.~Lu et al., ``Towards end-to-end automation of AI research,'' \textit{Nature}, vol.~651, no.~8107, pp.~914--919, 2026.
+
+\bibitem{si2024llmideas} C.~Si, D.~Yang, and T.~Hashimoto, ``Can LLMs generate novel research ideas? A large-scale human study with 100+ NLP researchers,'' in \textit{Proc.\ ICLR}, 2025.
+
+\bibitem{radensky2025scideator} M.~Radensky, S.~Shahid, R.~Fok, P.~Siangliulue, T.~Hope, and D.~S.~Weld, ``Scideator: Human-LLM compound system for scientific ideation through facet recombination and novelty evaluation,'' in \textit{Proc.\ ACM CAIS}, pp.~348--374, 2026.
+
+\bibitem{abramovich2025ablationbench} T.~Abramovich and G.~Chechik, ``AblationBench: Evaluating automated planning of ablations in empirical AI research,'' \textit{arXiv:2507.08038}, 2025.
+
+\bibitem{zhao2025abgen} Y.~Zhao et al., ``AbGen: Evaluating large language models in ablation study design and evaluation for scientific research,'' in \textit{Proc.\ ACL}, pp.~12479--12491, 2025.
+
+\bibitem{xiong2024kgcoi} G.~Xiong, E.~Xie, A.~H.~Shariatmadari, S.~Guo, S.~Bekiranov, and A.~Zhang, ``Improving scientific hypothesis generation with knowledge grounded large language models,'' \textit{arXiv:2411.02382}, 2024.
+
+\bibitem{ghafarollahi2024sciagents} A.~Ghafarollahi and M.~J.~Buehler, ``SciAgents: Automating scientific discovery through multi-agent intelligent graph reasoning,'' \textit{Adv.\ Mater.}, vol.~37, no.~22, p.~2413523, 2025.
+
+\bibitem{yamada2025aiscientistv2} Y.~Yamada et al., ``The AI Scientist-v2: Workshop-level automated scientific discovery via agentic tree search,'' \textit{arXiv:2504.08066}, 2025.
+
+\bibitem{hypoagents2025} S.~Duan, Y.~Tian, Q.~Bing, and X.~Shao, ``Bayes-entropy collaborative driven agents for research hypotheses generation and optimization,'' \textit{arXiv:2508.01746}, 2025.
+
+\bibitem{swanson1986} D.~R.~Swanson, ``Fish oil, Raynaud's syndrome, and undiscovered public knowledge,'' \textit{Perspect.\ Biol.\ Med.}, vol.~30, no.~1, pp.~7--18, 1986.
+
+\bibitem{blondel2008louvain} V.~D.~Blondel, J.-L.~Guillaume, R.~Lambiotte, and E.~Lefebvre, ``Fast unfolding of communities in large networks,'' \textit{J.\ Stat.\ Mech.}, P10008, 2008.
+
+\bibitem{tong2024causal} S.~Tong, K.~Mao, Z.~Huang, Y.~Zhao, and K.~Peng, ``Automating psychological hypothesis generation with AI: When large language models meet causal graph,'' \textit{Humanit.\ Soc.\ Sci.\ Commun.}, vol.~11, p.~896, 2024.
+
+\bibitem{fortunato2010community} S.~Fortunato, ``Community detection in graphs,'' \textit{Phys.\ Rep.}, vol.~486, pp.~75--174, 2010.
+
+\bibitem{yadan2019hydra} O.~Yadan, ``Hydra---A framework for elegantly configuring complex applications,'' \textit{GitHub}, 2019.
+
+\bibitem{baek2024researchagent} J.~Baek, S.~K.~Jauhar, S.~Cucerzan, and S.~J.~Hwang, ``ResearchAgent: Iterative research idea generation over scientific literature with large language models,'' in \textit{Proc.\ NAACL-HLT}, pp.~6709--6738, 2025.
+
+\bibitem{wang2024scimon} Q.~Wang, D.~Downey, H.~Ji, and T.~Hope, ``SciMON: Scientific inspiration machines optimized for novelty,'' in \textit{Proc.\ ACL}, pp.~279--299, 2024.
+
+\bibitem{zhang2024mlcopilot} L.~Zhang, Y.~Zhang, K.~Ren, D.~Li, and Y.~Yang, ``MLCopilot: Unleashing the power of large language models in solving machine learning tasks,'' in \textit{Proc.\ EACL}, pp.~2931--2959, 2024.
+
+\bibitem{gu2025llmjudge} J.~Gu et al., ``A survey on LLM-as-a-Judge,'' \textit{arXiv:2411.15594}, 2024.
+
+\bibitem{researchbench2025} Y.~Liu et al., ``ResearchBench: Benchmarking LLMs in scientific discovery via inspiration-based task decomposition,'' \textit{arXiv:2503.21248}, 2025.
+
+\bibitem{raghavan2007labelprop} U.~N.~Raghavan, R.~Albert, and S.~Kumara, ``Near linear time algorithm to detect community structures in large-scale networks,'' \textit{Phys.\ Rev.\ E}, vol.~76, p.~036106, 2007.
+
+\bibitem{seidman1983kcore} S.~B.~Seidman, ``Network structure and minimum degree,'' \textit{Soc.\ Netw.}, vol.~5, no.~3, pp.~269--287, 1983.
+
+\bibitem{velickovic2018gat} P.~Veli\v{c}kovi\'{c}, G.~Cucurull, A.~Casanova, A.~Romero, P.~Li\`{o}, and Y.~Bengio, ``Graph attention networks,'' in \textit{Proc.\ ICLR}, 2018.
+
+\bibitem{rong2020dropedge} Y.~Rong, W.~Huang, T.~Xu, and J.~Huang, ``DropEdge: Towards deep graph convolutional networks on node classification,'' in \textit{Proc.\ ICLR}, 2020.
+
+\bibitem{hu2022lora} E.~J.~Hu et al., ``LoRA: Low-rank adaptation of large language models,'' in \textit{Proc.\ ICLR}, 2022.
+
+\bibitem{guo2017calibration} C.~Guo, G.~Pleiss, Y.~Sun, and K.~Q.~Weinberger, ``On calibration of modern neural networks,'' in \textit{Proc.\ ICML}, pp.~1321--1330, 2017.
+
+\bibitem{reimers2019sbert} N.~Reimers and I.~Gurevych, ``Sentence-BERT: Sentence embeddings using Siamese BERT-networks,'' in \textit{Proc.\ EMNLP}, pp.~3982--3992, 2019.
+
+\bibitem{zhang2024realnet} X.~Zhang, M.~Xu, and X.~Zhou, ``RealNet: A feature selection network with realistic synthetic anomaly for anomaly detection,'' in \textit{Proc.\ CVPR}, pp.~16699--16708, 2024.
+
+\bibitem{sen2008collective} P.~Sen, G.~Namata, M.~Bilgic, L.~Getoor, B.~Gallagher, and T.~Eliassi-Rad, ``Collective classification in network data,'' \textit{AI Mag.}, vol.~29, no.~3, pp.~93--106, 2008.
+
+\end{thebibliography}
+
+\end{document}
